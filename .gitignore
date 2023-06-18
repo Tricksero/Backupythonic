@@ -1,0 +1,12 @@
+config.ini
+backups/*
+differential_backup/*
+full_backup/*
+itemslist/*
+Minecraft/*
+player_data/*
+venv/*
+defaults.txt
+timestamp
+task_schedule.py
+read_mc_data.py
