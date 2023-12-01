@@ -1,94 +1,166 @@
 import os
 import time
 import atexit
-from typing import Union
+from tqdm import tqdm
+from typing import Union, List, Callable, Tuple, Literal
 from datetime import date, datetime, timezone
-from tkinter import E
 from invoke import task, Context
 from ftplib import FTP, error_perm
 from pathlib import Path
-from configparser import RawConfigParser
+from configparser import ConfigParser
 
-TODAY = date.today()
-NOW = datetime.now()
 BASE_DIR = Path(__file__).resolve().parent
-BACKUP_DIR = "G:/fromDesktop/Programmierstuff/Python/backupFromServer/backups"
-TEMP_DIR = "G:/fromDesktop/Programmierstuff/Python/backupFromServer/temp"
-RETRY_LIMIT = 10000
-CONFIG = RawConfigParser()
-CONFIG = CONFIG.read(str(BASE_DIR / "config"))
+CONFIG = ConfigParser()
+CONFIG.read(str(BASE_DIR / "config.ini"))
+
+TIME_CONFIG = CONFIG["time"]
+USE_CONFIGURED_TIMESTAMP = TIME_CONFIG["use_configured"]
+TODAY = date.today() 
+NOW = datetime.now() 
+
 FTP_CONFIG = CONFIG["ftp"]
+HOST = FTP_CONFIG["host"]
+PORT = FTP_CONFIG["port"]
+USERNAME = FTP_CONFIG["username"]
+PASSWORD = FTP_CONFIG["password"]
+RETRY_LIMIT = int(FTP_CONFIG["retry_limit"])
+
+BACKUP_CONFIG = CONFIG["backups"]
+BACKUP_DIR = Path(BACKUP_CONFIG["default"])
+TEMP_DIR = Path(BACKUP_CONFIG["temp"])
+PATH_DISPLAY_LENGTH = int(BACKUP_CONFIG["path_display_length"])
+FILE_DISPLAY_LENGTH = int(BACKUP_CONFIG["file_display_length"])
+RECURSIVE = True
 
 
-with open(os.getcwd() + "/defaults.txt", "r") as defaults_file:
-    DEFAULT_CHUNKS = defaults_file.read()
-    defaults_file.close()
+def get_newest_full_backup_path(dir_path: Path) -> Tuple[Path, datetime]:
+    """
+    Returns the newest directory and its date for a given directory path
+    """
+    newest_directory = None
+    newest_modification_time = 0
 
-try:
+    # Iterate over the subdirectories in the parent directory
+    for subdirectory_name in os.listdir(dir_path):
+        subdirectory_path = os.path.join(dir_path, subdirectory_name)
+    
+        # Check if the path is a directory
+        if os.path.isdir(subdirectory_path):
+            # Get the last modification timestamp of the directory
+            modification_time = os.path.getmtime(subdirectory_path)
+        
+            # Compare the modification timestamp with the current newest
+            if modification_time > newest_modification_time:
+                newest_directory = subdirectory_name
+                newest_modification_time = modification_time
+
+    # Print the newest directory and its modification date
+    if newest_directory:
+        formatted_time = datetime.fromtimestamp(newest_modification_time)
+        #print("Newest directory:", newest_directory)
+        #print("Last modification date:", formatted_time)
+        return (dir_path / newest_directory, formatted_time)
+    else:
+        raise Exception("No directories found.")
+
+
+if os.path.exists(BASE_DIR / "timestamp") and not USE_CONFIGURED_TIMESTAMP:
     with open(BASE_DIR / "timestamp", "r") as timestamp_file:
         date_string = timestamp_file.read()
     DIFFERENTIAL_TIMESTAMP = datetime.strptime(date_string, '%Y-%m-%d %H:%M:%S')
-except:
-    print("no timestamp so using now as timestamp: ", NOW)
-    DIFFERENTIAL_TIMESTAMP = datetime.strptime(NOW, '%Y-%m-%d %H:%M:%S')
+else:
+    print("Using date of last full backup as last backup date: ", NOW)
+    try:
+        _, DIFFERENTIAL_TIMESTAMP = get_newest_full_backup_path(BACKUP_DIR / "full_backup")
+    except Exception as e:
+        print("using now as last backup date")
+        DIFFERENTIAL_TIMESTAMP = datetime.now()
 
-def authenticate_and_connect():
-    ftp = FTP('')
-    host=FTP_CONFIG["host"]
-    port=FTP_CONFIG["port"]
-    ftp.connect(host,port)
-    username = FTP_CONFIG["username"]
-    password = FTP_CONFIG["password"]
-    ftp.login(username, password)
 
-    ftp.cwd('Minecraft')
-    return ftp
+class FTPPath():
+    """
+    Since inheriting from pathlib.Path causes weird "_favour undefined" issues it is instead
+    implemented as a variable. The major Point of this custom class is to have a Path like object to
+    use for ftp operations that is compatible with Windowspath objects and its infamous "\\" shit.
+    """
+    def __init__(self, path: str):
+        self.path = Path(path)
 
-def create_backup_directory(directory_name):
-    dir = os.getcwd() + directory_name
-    if os.path.isdir(dir + f"/{str(TODAY)}"):
-        directory_list = os.listdir(dir)
+    def __call__(self):
+        return self.path
+
+    def __str__(self):
+        return str(self.path).replace("\\", "/")
+
+    def __truediv__(self, other):
+        if isinstance(other, Path):
+            return Path(str(other / str(self.path)[1:]))
+        return FTPPath(str(self.path / other))
+
+    def __rtruediv__(self, other):
+        if isinstance(other, Path):
+            return Path(str(other / str(self.path)[1:]))
+
+
+def get_all_paths_from_ftp(ftp, path: str) -> List[str]:
+    ftp.cwd(path)
+    file_and_directory_names = ftp.nlst()
+
+    for name in file_and_directory_names:
+        print(name)
+    # Return the list of file and directory names
+    return file_and_directory_names
+
+
+def authenticate_and_connect(host: str = HOST, port: int = PORT, username: str = USERNAME, password: str = PASSWORD) -> FTP:
+    print("connect...")
+    retry = 0
+    while retry < RETRY_LIMIT:
+        try:
+            ftp = FTP('')
+            ftp.connect(host, int(port))
+            ftp.login(username, password)
+            return ftp
+        except Exception as e:
+            retry += 1
+            print(e)
+            print(f"--- connection failed, {RETRY_LIMIT - retry} retries left ---")
+    raise Exception()
+
+
+def create_backup_directory(directory_name: Path) -> Path:
+    """
+    Creates a backup directory with the currend date as the name incrementing with (1), (2), ...
+    if necessary and returns the resulting backup path
+    """
+    if os.path.isdir(directory_name / str(TODAY)):
+        directory_list = os.listdir(directory_name)
         same_dir_names = 0
         for dir_name in directory_list:
             if f"{str(TODAY)}" in dir_name:
                 same_dir_names+=1
 
-        print(os.listdir(dir))
-        os.mkdir(dir + f"/{str(TODAY)}({same_dir_names})")
-        dir = dir + f"/{str(TODAY)}({same_dir_names})"
+        #create directories like 01.01.2023(2) when 01.01.2023 or 01.01.2023(1) already exists
+        os.makedirs(directory_name / f"{str(TODAY)}({same_dir_names})")
+        directory_name = directory_name / f"{str(TODAY)}({same_dir_names})"
+
     else:
-        os.mkdir(dir + "/" + str(TODAY))
-        dir = dir + "/" + str(TODAY)
-    return dir
+        os.makedirs(directory_name / str(TODAY))
+        directory_name = directory_name / str(TODAY)
+
+    return directory_name
 
 
-def copy_file(ftp, dir, file_name):
-    try:
-        print(file_name)
-        with open(Path(f"{dir}/{file_name}"), 'wb+') as region_file: 
-            ftp.retrbinary('RETR ' + file_name, region_file.write)
-            region_file.close()
-    except PermissionError as e:
-        print(e)
-
-def write_file(ftp, dir, file_name):
-    print(file_name)
-    with open(f"{dir}/{file_name}", 'wb+') as region_file: 
-        ftp.storbinary('STOR ' + file_name, region_file)
-        region_file.close()
-
-
-def process_dir(dir, ftp, dir_name, content_path, differential=False) -> None:
-    print("process directory: ", dir_name)
-    os.mkdir(f"{dir}/{dir_name}")
-    try:
-        dir_content = ftp.nlst()
-    except:
-        print("no content in directory")
-        return
-    dir = f"{dir}/{dir_name}"
-    for content in dir_content:
-        ftp = copy_file_or_directory(dir, ftp, content, content_path, differential)
+class FTPEntry:
+    """
+    Represents a file or a directory at your FTP Server
+    """
+    def __init__(self, name: str, is_file: bool, is_directory: bool, size: int, modified_time: datetime):
+        self.name = name
+        self.is_file = is_file
+        self.is_directory = is_directory
+        self.size = size
+        self.modified_time = modified_time
 
 
 def is_file_newer(ftp, filename, datetime_threshold) -> bool:
@@ -106,180 +178,192 @@ def is_file_newer(ftp, filename, datetime_threshold) -> bool:
         return False
 
 
-def copy_file_or_directory(dir, ftp, content, content_path, differential=False):
-    retry = 0
-    while retry < RETRY_LIMIT:
-        try:
-            try:
-                old_ftp = ftp
-                if retry > 0:
-                    print("retrying")
-                    ftp = authenticate_and_connect()
-                    print("reconnected: ", ftp.pwd())
-                    ftp.cwd(content_path[1:])
-                    
-            except Exception as e:
-                print("reconnect failure: ", e)
-                ftp = old_ftp
+def get_ftp_entries(ftp: FTP, path: Path):
+    """
+    Get a listing of ftp entries and some values like the last change date
+    """
+    listing = []
+    print(ftp.pwd())
+    ftp.retrlines('LIST ' + str(path), listing.append)
 
-            print("check for directory in ftp", ftp.pwd())
-            #print("already there?: ", content_path + "/" + content)
-            if not ftp.pwd() == content_path + "/" + content:
-                ftp.cwd(content)
-            else: 
-                print("here", content_path + "/" + content)
-            process_dir(dir, ftp, content, content_path + "/" + content, differential)
-            ftp.cwd("../")
-            return ftp
-        except Exception as e:
-            print("Could not create directory: ", e)
-            try: 
-                if differential:
-                    if is_file_newer(ftp, content, DIFFERENTIAL_TIMESTAMP):
-                        print("file newer: ", content)
-                        copy_file(ftp, dir, content)
-                else: 
-                    copy_file(ftp, dir, content)
-                return ftp
-            except Exception as e:
-                print("could not create file because: ", e)
-                retry += 1
-                time.sleep(5)
-    print("Connection lost")
+    entries = []
+
+    for line in listing:
+        #print(line)
+        entry_info = line.split()
+        permissions = entry_info[0]
+        name = entry_info[8]
+
+        is_file = permissions.startswith('-')
+        is_directory = permissions.startswith('d')
+        size = int(entry_info[4])
+        #print(entry_info)
+        if is_file:
+            resp = ftp.sendcmd('MDTM ' + str(path / name))
+            timestamp = resp[4:]  # Extract the timestamp from the response
+            modified_time = datetime.strptime(timestamp, "%Y%m%d%H%M%S")
+        else:
+            modified_time = datetime.strptime(entry_info[5] + ' ' + entry_info[6] + ' ' + entry_info[7], '%b %d %Y')
+
+        entry = FTPEntry(name, is_file, is_directory, size, modified_time)
+        entries.append(entry)
+
+    return entries
 
 
-@task
-def backup_chunks(ctx, chunks=DEFAULT_CHUNKS):
-    dir = create_backup_directory("/backups")
-    if chunks == "" or not "/" in chunks:
-        print("no chunks")
-        return 
+def copy_file(ftp: FTP, backup_path: Path, file_name: str) -> None:
+    backup_file(ftp, backup_path, file_name)
+
+
+def backup_file(ftp: FTP, backup_path: Path, entry: FTPEntry) -> None:
+    """
+    Backups a file from ftp in the given directory path with the same file name
+    """
+    file_size = entry.size
+    try:
+        def write_to_file(data):
+            region_file.write(data)
+            pbar.update(len(data))
     
-    chunks = chunks.split("/")
-    
-    ftp = authenticate_and_connect()
-    ftp.cwd('world')
-    save_usercache(ftp, dir)
-    ftp.cwd('region')
-
-    os.mkdir(dir + "/region")
-    for fileName in chunks:
-        with open(dir + "/region/" + fileName, 'wb+') as region_file: 
-            ftp.retrbinary('RETR ' + fileName, region_file.write)
+        if len(str(backup_path)) > PATH_DISPLAY_LENGTH:
+            print(f"create ...{str(backup_path)[-PATH_DISPLAY_LENGTH:]}/{entry.name[:FILE_DISPLAY_LENGTH]} ")
+        else:
+            print(f"create {str(backup_path)[-PATH_DISPLAY_LENGTH:]}/{entry.name[:FILE_DISPLAY_LENGTH]} ")
+        pbar = tqdm(total=file_size, unit='B', unit_scale=True)
+        with open(backup_path / entry.name, 'wb+') as region_file: 
+            ftp.retrbinary('RETR ' + entry.name, write_to_file, blocksize=8194)
             region_file.close()
-    ftp.cwd('../')
-    ftp.cwd('entities')
-    os.mkdir(dir + "/entities")
-    for fileName in chunks:
-        with open(dir + "/entities/" + fileName, 'wb+') as entities_file: 
-            ftp.retrbinary('RETR ' + fileName, entities_file.write)
-            entities_file.close()
+    except Exception as e:
+        print(e)
+        pbar.close()
+        raise Exception
+    pbar.close()
 
 
-@task
-def full_backup(ctx):
-    dir = create_backup_directory("/full_backup")
-    backup(ctx, dir, differential=False)
+def backup_ftp_entries(
+    ftp: FTP,
+    ftp_entries: List[FTPEntry] = [],
+    recursive: bool = False,
+    backup_path: Path = TEMP_DIR,
+    custom_filter: Callable[[FTPEntry, Tuple[any]], bool] = (lambda entry, *args, **kwargs: True),
+    *args,
+    **kwargs
+) -> None:
+
+    """
+    General Backup function to be used by most commands doing backups.
+    """
+    current_ftp_dir = ftp.pwd()
+    for entry in ftp_entries:
+        retry = True
+        while retry:
+            try:
+                print_entry(entry)
+                if entry.is_file and custom_filter(entry, *args, **kwargs):
+                    backup_file(ftp, backup_path, entry)
 
 
-@task
-def differential_backup(ctx):
+                if entry.is_directory and recursive:
+                    ftp_entries = get_ftp_entries(ftp, FTPPath(ftp.pwd()) / entry.name)
 
-    dir = create_backup_directory("/differential_backup")
+                    if not os.path.exists(backup_path / entry.name) and ftp_entries:
+                        os.makedirs(backup_path / entry.name)  
+                        ftp.cwd(entry.name)
+                        backup_ftp_entries(ftp, ftp_entries, recursive, backup_path / entry.name, custom_filter, *args, **kwargs)
+                        ftp.cwd("../")
+                else:
+                    if not os.path.exists(backup_path / entry.name):
+                        os.makedirs(backup_path / entry.name)  
+                break
+            except Exception as e:
+                ftp = authenticate_and_connect()
+                ftp.cwd(current_ftp_dir)
+                continue
 
-    backup(ctx, dir, differential=True)
-
-
-def backup(ctx, dir, differential=False):
-    ftp = authenticate_and_connect()
-    process_dir(dir, ftp, "Minecraft", "", differential)
-    
-    with open(BASE_DIR / "timestamp", "w+") as timestamp_file:
-        timestamp_file.write(NOW.strftime('%Y-%m-%d %H:%M:%S'))
-
-
-#@task
-def load_chunk_backup(ctx):
-    backup_content = os.listdir(BACKUP_DIR)
-    most_recent_date = "2000-10-01"
-    for backup_dirname in backup_content:
-        try:
-            example_dirname = f"{BACKUP_DIR}/{backup_dirname}/region"
-            stats = os.path.getctime(f"{example_dirname}/{os.listdir(example_dirname)[0]}")
-            date_obj = datetime.fromtimestamp(stats)
-            if datetime.strptime(most_recent_date[:10], "%Y-%m-%d") < date_obj:
-                most_recent_date = backup_dirname
-        except Exception as e:
-            print(e)
-            
-    print(f"result: {most_recent_date}")
-    ftp = authenticate_and_connect()
-    replace_dir = f"{BACKUP_DIR}/{most_recent_date}"
-    dir = TEMP_DIR
-    chunks = {}
-    chunks["region"] = os.listdir(f"{BACKUP_DIR}/{most_recent_date}/region")
-    chunks["entities"] = os.listdir(f"{BACKUP_DIR}/{most_recent_date}/region")
-    ftp.cwd('world')
-    ftp.cwd('region')
-
-    
-    os.mkdir(dir + "/region")
-    for file_name in chunks["region"]:
-        copy_file(ftp, dir + "/region", file_name)
-        write_file(ftp, replace_dir + "/region", file_name)
-
-    ftp.cwd('../')
-    ftp.cwd('entities')
-    os.mkdir(dir + "/entities")
-    for file_name in chunks["entities"]:
-        copy_file(ftp, dir + "/entities", file_name)
-        write_file(ftp, replace_dir + "/entities", file_name)
-
-
-def save_usercache(ftp, dir):
-    print(dir)
-    file_name = "usercache.json"
-    with open(dir + "/" + file_name, 'wb+') as usercache_file: 
-        ftp.retrbinary('RETR ' + file_name, usercache_file.write)
-        usercache_file.close()
-
-
-#differential_backup(Context())
-
-
-
-def get_newest_full_backup_path() -> Union[str, Path]:
-    full_backup_directory = BASE_DIR / "full_backup"
-
-    newest_directory = None
-    newest_modification_time = 0
-
-    # Iterate over the subdirectories in the parent directory
-    for subdirectory_name in os.listdir(full_backup_directory):
-        subdirectory_path = os.path.join(full_backup_directory, subdirectory_name)
-    
-        # Check if the path is a directory
-        if os.path.isdir(subdirectory_path):
-            # Get the last modification timestamp of the directory
-            modification_time = os.path.getmtime(subdirectory_path)
-        
-            # Compare the modification timestamp with the current newest
-            if modification_time > newest_modification_time:
-                newest_directory = subdirectory_name
-                newest_modification_time = modification_time
-
-    # Print the newest directory and its modification date
-    if newest_directory:
-        formatted_time = os.path.strftime("%Y-%m-%d %H:%M:%S", os.localtime(newest_modification_time))
-        print("Newest directory:", newest_directory)
-        print("Last modification date:", formatted_time)
-        return full_backup_directory / newest_directory
+def print_entry(ftp_entry: FTPEntry, accurate_directory_dates: bool = False) -> None:
+    """
+    Lists one FTP entry and its values in a well readable format
+    """
+    print(f"Name: {ftp_entry.name}")
+    print(f"Is File: {ftp_entry.is_file}")
+    print(f"Is Directory: {ftp_entry.is_directory}")
+    print(f"Size: {ftp_entry.size}")
+    if ftp_entry.is_directory and not accurate_directory_dates:
+        print(f"Modified Time: {ftp_entry.modified_time} directory dates might not be accurate")
     else:
-        raise Exception("No directories found.")
+        print(f"Modified Time: {ftp_entry.modified_time}")
+    print()
 
+
+def print_entries(ftp_entries: List[FTPEntry], *args) -> None:
+    """
+    Lists FTP entries and its values in a well readable format
+    Based on print_entry
+    """
+    for entry in ftp_entries:
+        print_entry(entry, *args)
+
+
+def full_backup(backup_path: Path, ftp_path: FTPPath, recursive: bool) -> None:
+    backup_path = create_backup_directory(backup_path)
+    ftp = authenticate_and_connect()
+    ftp_entries = get_ftp_entries(ftp, ftp_path)
+
+    if not os.path.exists(backup_path / ftp_path) and ftp_entries:
+        os.makedirs(backup_path / ftp_path)  
+
+    print(backup_path / ftp_path)
+    ftp.cwd(str(ftp_path))
+    backup_ftp_entries(ftp, ftp_entries, recursive, backup_path / ftp_path)
+
+
+def differential_backup(backup_path: Path, ftp_path: FTPPath, recursive: bool) -> None:
+    backup_path = create_backup_directory(backup_path)
+    ftp = authenticate_and_connect()
+    ftp_entries = get_ftp_entries(ftp, ftp_path)
+
+    def differential_backup_file_filter(entry: FTPEntry, timestamp: datetime, *args, **kwargs) -> bool:
+        """
+        custom filter passed to functions to sort out things based on their last modification date for differential backups
+        """
+        if FTPEntry.modified_time > timestamp:
+            return True
+        else:
+            return False
+
+    if not os.path.exists(backup_path / ftp_path) and ftp_entries:
+        os.makedirs(backup_path / ftp_path)  
+
+    ftp.cwd(str(ftp_path))
+    backup_ftp_entries(ftp, ftp_entries, recursive, backup_path / ftp_path, differential_backup_file_filter)
+
+
+@task
+def backup(
+    c: Context,
+    mode: Literal["full", "differential"] = "full",
+    backup_path: Path = BACKUP_DIR,
+    ftp_path: FTPPath = FTPPath("/Minecraft"),
+    recursive: bool = RECURSIVE
+) -> None:
+    """
+    --mode=differential
+    --mode=full
+    """
+    if mode == "differential":
+        input("confirm differential backup")
+        differential_backup(backup_path / "differential_backup", ftp_path, recursive)
+    if mode == "full":
+        input("confirm full backup")
+        full_backup(backup_path / "full_backup", ftp_path, recursive)
+    return 
+
+
+if __name__ == "__main__":
+    #backup(full=True, ftp_path=FTPPath("/Minecraft/world"))
+    backup(Context(), full=True)
 
 def print_exit_message():
     print(f"--- EXITED AFTER {datetime.now() - NOW} ---")
-
 
 atexit.register(print_exit_message)
