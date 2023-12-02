@@ -10,3 +10,6 @@ defaults.txt
 timestamp
 task_schedule.py
 read_mc_data.py
+old/**
+notes/**
+!sample/**
