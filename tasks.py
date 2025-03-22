@@ -326,8 +326,8 @@ def backup_ftp_entries(
                         if not os.path.exists(backup_path / entry.name):
                             os.makedirs(backup_path / entry.name)
                 break
-            except ftp.error_perm as e:
-                continue
+            except error_perm as e:
+                break
             except Exception as e:
                 print("error", e, type(e), entry.__dict__)
                 ftp = authenticate_and_connect()
